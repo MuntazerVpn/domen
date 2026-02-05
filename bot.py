@@ -15,7 +15,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -232,7 +231,6 @@ def ensure_quota_row(uid: int) -> None:
         conn.commit()
 
 def reset_quota_if_new_day(uid: int) -> Tuple[int, int]:
-    """returns used, bonus after possibly resetting used on new day"""
     today = today_iso()
     ensure_quota_row(uid)
     cur.execute("SELECT used, bonus, last_date FROM quota WHERE user_id=?", (uid,))
@@ -251,7 +249,6 @@ def add_bonus_attempt(uid: int, amount: int = 1) -> None:
     conn.commit()
 
 def consume_attempt(uid: int) -> Tuple[bool, int]:
-    """Consume one attempt if available. Returns (allowed, remaining). Admin unlimited."""
     if is_admin(uid):
         return True, 999999
 
@@ -268,7 +265,6 @@ def consume_attempt(uid: int) -> Tuple[bool, int]:
     return True, remaining
 
 def get_today_stats(uid: int) -> Tuple[int, int, int]:
-    """used, bonus, total_limit"""
     if is_admin(uid):
         return 0, 0, 999999
     used, bonus = reset_quota_if_new_day(uid)
@@ -279,7 +275,6 @@ def get_force_channels() -> List[str]:
     try:
         arr = json.loads(raw)
         if isinstance(arr, list):
-            # normalize @
             out = []
             for c in arr:
                 if not isinstance(c, str):
@@ -295,10 +290,15 @@ def get_force_channels() -> List[str]:
         pass
     return ["@eshop_2"]
 
+# ✅✅✅ إصلاح الاشتراك الإجباري (نسخة نهائية)
 async def is_user_subscribed(bot, uid: int) -> Tuple[bool, str]:
-    """Check forced channels. Return (ok, error_text_if_any)"""
+    """
+    Return (ok, info)
+    info may contain status/error for admin debugging.
+    """
     if is_admin(uid):
         return True, ""
+
     channels = get_force_channels()
     if not channels:
         return True, ""
@@ -306,20 +306,40 @@ async def is_user_subscribed(bot, uid: int) -> Tuple[bool, str]:
     for ch in channels:
         try:
             member = await bot.get_chat_member(chat_id=ch, user_id=uid)
-            st = member.status
-            if st in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.CREATOR):
+            status = str(member.status).lower()  # safest across versions
+
+            # statuses accepted
+            if status in ("member", "administrator", "creator"):
                 continue
-            # left/kicked
-            return False, ch
-        except Exception:
-            # غالبًا البوت مو Admin بالقناة أو القناة خاصة
-            return False, ch
+
+            # left/kicked/restricted
+            return False, f"{ch} | status={status}"
+
+        except Exception as e:
+            reason = str(e)
+            print(f"[SUB_CHECK_ERROR] channel={ch} user={uid} error={reason}")
+
+            # أرسل السبب للأدمن تلقائياً (حتى نعرف ليش يفشل)
+            if ADMIN_ID:
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ خطأ فحص الاشتراك\n"
+                        f"القناة: {ch}\n"
+                        f"المستخدم: {uid}\n"
+                        f"السبب: {reason}\n\n"
+                        f"✅ تأكد: القناة عامة + اسمها صحيح + البوت مشرف"
+                    )
+                except:
+                    pass
+
+            return False, f"{ch} | error={reason}"
+
     return True, ""
 
 def force_join_keyboard(channels: List[str]) -> InlineKeyboardMarkup:
     btns = []
     for ch in channels[:3]:
-        # رابط القناة
         username = ch.lstrip("@")
         btns.append([InlineKeyboardButton(f"🔗 الدخول إلى {ch}", url=f"https://t.me/{username}")])
     btns.append([InlineKeyboardButton("✅ تحقق من الاشتراك", callback_data="checksub")])
@@ -380,7 +400,6 @@ def forced_channels_admin_keyboard() -> ReplyKeyboardMarkup:
 
 # ================== Referral ==================
 def parse_ref_from_start(arg: str) -> Optional[int]:
-    # ref_123456
     if not arg:
         return None
     if arg.startswith("ref_"):
@@ -391,11 +410,9 @@ def parse_ref_from_start(arg: str) -> Optional[int]:
     return None
 
 def reward_referral_if_needed(new_uid: int, ref_uid: int) -> bool:
-    """Reward referrer +1 bonus if new user first time and not rewarded yet."""
     if ref_uid == new_uid:
         return False
 
-    # must exist new user row
     cur.execute("SELECT referred_by, ref_rewarded FROM users WHERE user_id=?", (new_uid,))
     row = cur.fetchone()
     if not row:
@@ -404,12 +421,9 @@ def reward_referral_if_needed(new_uid: int, ref_uid: int) -> bool:
     referred_by, ref_rewarded = row
     if ref_rewarded == 1:
         return False
-
-    # accept only if never set referred_by
     if referred_by is not None:
         return False
 
-    # set referred_by and reward
     cur.execute("UPDATE users SET referred_by=?, ref_rewarded=1 WHERE user_id=?", (ref_uid, new_uid))
     conn.commit()
 
@@ -441,12 +455,10 @@ async def notify_admin_new_user(context: ContextTypes.DEFAULT_TYPE, update: Upda
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
-    # سجل/حدّث المستخدم
     is_new = register_user(update)
     if is_new:
         await notify_admin_new_user(context, update)
 
-    # referral from start param
     ref_uid = None
     if context.args:
         ref_uid = parse_ref_from_start(context.args[0])
@@ -459,7 +471,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-    # قيود بوت/حظر
     if not bot_is_on() and not is_admin(uid):
         await update.message.reply_text("⛔ البوت متوقف مؤقتًا.\nيرجى المحاولة لاحقًا.")
         return
@@ -467,10 +478,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ تم حظرك من استخدام البوت.")
         return
 
-    # اشتراك إجباري
-    ok, ch = await is_user_subscribed(context.bot, uid)
+    ok, info = await is_user_subscribed(context.bot, uid)
     if not ok:
         channels = get_force_channels()
+        # للأدمن فقط: اعرض السبب بالمحادثة (يساعدك تعرف المشكلة)
+        if is_admin(uid) and info:
+            await update.message.reply_text(f"⚠️ سبب فشل التحقق:\n{info}")
+
         await update.message.reply_text(
             "🔒 يجب الاشتراك في القناة/القنوات أولاً لاستخدام البوت.\n\n"
             "بعد الاشتراك اضغط: ✅ تحقق من الاشتراك",
@@ -570,7 +584,6 @@ async def handle_admin_waiting_inputs(update: Update, context: ContextTypes.DEFA
     if not is_admin(uid):
         return False
 
-    # قناة الاشتراك الإجباري submenu
     if context.user_data.get("admin_channels_menu"):
         if text == "🔙 رجوع":
             context.user_data["admin_channels_menu"] = False
@@ -626,7 +639,6 @@ async def handle_admin_waiting_inputs(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("✅ تم حذف القناة (إن كانت موجودة).", reply_markup=forced_channels_admin_keyboard())
         return True
 
-    # ban/unban/welcome/broadcast
     if context.user_data.get("admin_wait_ban"):
         context.user_data["admin_wait_ban"] = False
         try:
@@ -680,7 +692,6 @@ async def handle_admin_waiting_inputs(update: Update, context: ContextTypes.DEFA
 
 # ================== User handlers ==================
 async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Common guard: bot status, ban, subscription. Return True if allowed."""
     uid = update.effective_user.id
 
     if not bot_is_on() and not is_admin(uid):
@@ -708,19 +719,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     register_user(update)
 
-    # admin waiting inputs first
     if await handle_admin_waiting_inputs(update, context, text):
         return
-
-    # admin buttons
     if await handle_admin_text(update, context, text):
         return
 
-    # guard for normal users/admins
     if not await guard(update, context):
         return
 
-    # buttons
     if text == "🔗 ربط IP":
         context.user_data["await_ip"] = True
         await update.message.reply_text("📥 أرسل IP الآن:")
@@ -779,7 +785,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # create by ip
     if context.user_data.get("await_ip"):
         context.user_data["await_ip"] = False
         ip = text
@@ -790,9 +795,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         label = random_label(6)
-        fqdn = f"{label}.{CF_BASE_DOMAIN}"           # A ثابت
-        ns_name = f"ns.{label}.{CF_BASE_DOMAIN}"     # NS مثل الصورة
-        ns_value = fqdn                               # مثل الصورة: managed by fqdn
+        fqdn = f"{label}.{CF_BASE_DOMAIN}"
+        ns_name = f"ns.{label}.{CF_BASE_DOMAIN}"
+        ns_value = fqdn
 
         try:
             cf_upsert_record("A", fqdn, ip, proxied=False, ttl=1)
@@ -817,18 +822,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # rebind flow
     if context.user_data.get("rebind_domain"):
         sub = context.user_data.pop("rebind_domain")
         ip = text.strip()
 
         label = sub.split(".", 1)[0]
         ns_name = f"ns.{label}.{CF_BASE_DOMAIN}"
-        ns_value = sub  # label.base
+        ns_value = sub
 
         try:
             cf_upsert_record("A", sub, ip, proxied=False, ttl=1)
-            # تأكيد NS مثل الصورة (ولو كان محذوف يرجع)
             cf_upsert_record("NS", ns_name, ns_value, ttl=1)
 
             cur.execute("UPDATE domains SET ip=? WHERE user_id=? AND subdomain=?", (ip, uid, sub))
@@ -853,13 +856,18 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = q.data
 
-    # check subscription button
+    # ✅ تحقق من الاشتراك
     if data == "checksub":
-        ok, _ = await is_user_subscribed(context.bot, uid)
+        ok, info = await is_user_subscribed(context.bot, uid)
         if ok:
             await q.message.reply_text("✅ تم التحقق! تفضل استخدم البوت.", reply_markup=main_keyboard(uid))
         else:
             channels = get_force_channels()
+
+            # للأدمن فقط: اعرض السبب
+            if is_admin(uid) and info:
+                await q.message.reply_text(f"⚠️ سبب فشل التحقق:\n{info}")
+
             await q.message.reply_text(
                 "❌ لست مشتركًا بعد.\nاشترك ثم اضغط ✅ تحقق من الاشتراك",
                 reply_markup=force_join_keyboard(channels)
@@ -876,10 +884,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, _ = await is_user_subscribed(context.bot, uid)
     if not ok:
         channels = get_force_channels()
-        await q.message.reply_text(
-            "🔒 يجب الاشتراك أولاً.",
-            reply_markup=force_join_keyboard(channels)
-        )
+        await q.message.reply_text("🔒 يجب الاشتراك أولاً.", reply_markup=force_join_keyboard(channels))
         return
 
     if data.startswith("copy|"):
